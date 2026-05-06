@@ -806,15 +806,23 @@ function doPost(e) {
 }
 
 function doGet(e) {
-  if (e.parameter.action === 'ping') return ok('pong');
+  const cb = e.parameter.callback;
+  if (e.parameter.action === 'ping') {
+    const result = JSON.stringify({ok: true, result: 'pong'});
+    if (cb) return ContentService.createTextOutput(cb + '(' + result + ')')
+      .setMimeType(ContentService.MimeType.JAVASCRIPT);
+    return ok('pong');
+  }
   const ss = SpreadsheetApp.openById(SHEET_ID);
   const sheet = ss.getSheetByName(SHEET_NAME);
   if (!sheet) return ok([]);
   const rows = sheet.getDataRange().getValues();
   const headers = rows[0];
   const data = rows.slice(1).map(r => Object.fromEntries(headers.map((h,i) => [h, r[i]])));
-  return ContentService.createTextOutput(JSON.stringify({ok: true, data}))
-    .setMimeType(ContentService.MimeType.JSON);
+  const result = JSON.stringify({ok: true, data});
+  if (cb) return ContentService.createTextOutput(cb + '(' + result + ')')
+    .setMimeType(ContentService.MimeType.JAVASCRIPT);
+  return ContentService.createTextOutput(result).setMimeType(ContentService.MimeType.JSON);
 }
 
 function buildRow(p) {
@@ -1606,7 +1614,18 @@ function confirmDelete() {
 let sheetsUrl = localStorage.getItem('p3d_sheets_url') || '';
 
 function saveSheetsUrl() {
-  sheetsUrl = document.getElementById('sheets-url').value.trim();
+  let url = document.getElementById('sheets-url').value.trim();
+  // Auto-fix: if user pasted just the script ID, complete the URL
+  if(url && !url.startsWith('http')) {
+    url = 'https://script.google.com/macros/s/' + url + '/exec';
+    document.getElementById('sheets-url').value = url;
+  }
+  // Auto-fix: ensure /exec at the end
+  if(url && url.includes('script.google.com') && !url.endsWith('/exec')) {
+    url = url.replace(/\/?(exec)?$/, '/exec');
+    document.getElementById('sheets-url').value = url;
+  }
+  sheetsUrl = url;
   localStorage.setItem('p3d_sheets_url', sheetsUrl);
   updateSheetsBadge();
 }
@@ -1627,38 +1646,67 @@ function updateSheetsBadge() {
 
 async function testSheetsConnection() {
   if(!sheetsUrl) { alert('Cole a URL do Apps Script primeiro.'); return; }
+  saveSheetsUrl();
   const res = document.getElementById('sheets-test-result');
   res.style.display = 'block';
   res.style.background = '#FEF0E0'; res.style.color = 'var(--amber)';
   res.textContent = '⏳ Testando conexão...';
-  try {
-    const r = await fetch(sheetsUrl + '?action=ping', {method:'GET'});
-    const j = await r.json();
-    if(j.ok) {
+
+  // JSONP to bypass CORS from local file
+  const cbName = 'p3d_ping_' + Date.now();
+  const script = document.createElement('script');
+  let done = false;
+
+  const timeout = setTimeout(() => {
+    if(done) return; done = true;
+    if(script.parentNode) document.body.removeChild(script);
+    delete window[cbName];
+    res.style.background = 'var(--red-light)'; res.style.color = 'var(--red)';
+    res.innerHTML = '❌ Sem resposta (timeout).<br>Verifique se a URL está correta e o acesso é <b>"Qualquer pessoa"</b>.';
+  }, 8000);
+
+  window[cbName] = function(data) {
+    if(done) return; done = true;
+    clearTimeout(timeout);
+    if(script.parentNode) document.body.removeChild(script);
+    delete window[cbName];
+    if(data && data.ok) {
       res.style.background = 'var(--green-light)'; res.style.color = 'var(--green)';
       res.textContent = '✅ Conexão OK! Apps Script respondeu corretamente.';
-    } else throw new Error(j.error);
-  } catch(e) {
+    } else {
+      res.style.background = 'var(--red-light)'; res.style.color = 'var(--red)';
+      res.textContent = '❌ Resposta inesperada do servidor.';
+    }
+  };
+
+  script.onerror = () => {
+    if(done) return; done = true;
+    clearTimeout(timeout);
+    if(script.parentNode) document.body.removeChild(script);
+    delete window[cbName];
     res.style.background = 'var(--red-light)'; res.style.color = 'var(--red)';
-    res.textContent = '❌ Falha: ' + e.message + '. Verifique se a URL está correta e o acesso é "Qualquer pessoa".';
-  }
+    res.innerHTML = '❌ URL inválida ou inacessível.<br>Verifique se termina com <b>/exec</b>.';
+  };
+
+  script.src = sheetsUrl + '?action=ping&callback=' + cbName;
+  document.body.appendChild(script);
 }
 
 async function sheetsUpsert(product) {
   if(!sheetsUrl) return;
   try {
     await fetch(sheetsUrl, {
-      method: 'POST',
+      method: 'POST', mode: 'no-cors',
       body: JSON.stringify({ action: 'upsert', row: product })
     });
-  } catch(e) { console.warn('Sheets sync failed:', e); }
+  } catch(e) { console.warn('Sheets upsert failed:', e); }
 }
 
 async function sheetsDelete(id) {
   if(!sheetsUrl) return;
   try {
     await fetch(sheetsUrl, {
-      method: 'POST',
+      method: 'POST', mode: 'no-cors',
       body: JSON.stringify({ action: 'delete', id })
     });
   } catch(e) { console.warn('Sheets delete failed:', e); }
@@ -1669,15 +1717,13 @@ async function sheetsSyncAll() {
   const btn = document.getElementById('btn-sync-all');
   if(btn) { btn.disabled = true; btn.textContent = '⏳ Sincronizando...'; }
   try {
-    const r = await fetch(sheetsUrl, {
-      method: 'POST',
+    await fetch(sheetsUrl, {
+      method: 'POST', mode: 'no-cors',
       body: JSON.stringify({ action: 'sync_all', products })
     });
-    const j = await r.json();
-    if(j.ok) alert(`✅ ${products.length} produto(s) sincronizados com a planilha!`);
-    else throw new Error(j.error);
+    alert(`✅ ${products.length} produto(s) enviados!\nAbra a planilha para confirmar.`);
   } catch(e) {
-    alert('❌ Erro ao sincronizar: ' + e.message);
+    alert('❌ Erro: ' + e.message);
   } finally {
     if(btn) { btn.disabled = false; btn.textContent = '🔄 Sincronizar tudo agora'; }
   }
